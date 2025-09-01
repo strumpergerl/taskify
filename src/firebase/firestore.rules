@@ -1,0 +1,133 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+
+    function isMember(groupId) {
+      return exists(/databases/$(database)/documents/groups/$(groupId)/members/$(uid()));
+    }
+    function isAdmin(groupId) {
+      return isMember(groupId) &&
+        get(/databases/$(database)/documents/groups/$(groupId)/members/$(uid())).data.role == 'admin';
+    }
+
+    // -- groups gyökér
+    match /groups/{groupId} {
+      // csoport meta
+      allow read: if isMember(groupId);
+      allow create: if signedIn();         // bárki létrehozhat saját csoportot (MVP)
+      allow update, delete: if isAdmin(groupId);
+
+      // -- tagok (subcollection)
+      match /members/{userId} {
+        allow read: if isMember(groupId) || (signedIn() && uid() == userId);
+
+        // belépés/join: a saját doc-odat hozhatod létre
+        allow create: if signedIn() && uid() == userId && !exists(resource.path);
+
+        // user módosíthatja a saját "profil" mezőit; role/points csak admin
+        allow update: if
+          (uid() == userId && resource.data.diff(request.resource.data).changedKeys()
+            .hasOnly(['displayName','photoURL'])) ||
+          isAdmin(groupId);
+
+        allow delete: if isAdmin(groupId);
+      }
+
+      // -- feladatok
+      match /tasks/{taskId} {
+        allow read: if isMember(groupId);
+        allow create: if isAdmin(groupId);
+
+        // update: admin bármit, assignee korlátozottan, claim tranzakció kliensről
+        allow update: if
+          // admin: mindent
+          isAdmin(groupId)
+          ||
+          // CLAIM: még nincs gazdája -> én leszek a gazdája; státusz not_started -> in_progress (vagy maradhat not_started)
+          (
+            isMember(groupId) &&
+            resource.data.assignee == null &&
+            request.resource.data.assignee == uid() &&
+            resource.data.status == 'not_started' &&
+            request.resource.data.status in ['in_progress','not_started'] &&
+            // csak ezeket a mezőket engedjük változni
+            resource.data.diff(request.resource.data).changedKeys()
+              .hasOnly(['assignee','status','claimedAt','updatedAt'])
+          )
+          ||
+          // ASSIGNEE státuszváltás: csak a saját feladatomat, engedett átmenetek
+          (
+            isMember(groupId) &&
+            resource.data.assignee == uid() &&
+            resource.data.status in ['not_started','in_progress','blocked'] &&
+            request.resource.data.status in ['in_progress','done','blocked'] &&
+            resource.data.diff(request.resource.data).changedKeys()
+              .hasOnly(['status','updatedAt'])
+          );
+
+        allow delete: if isAdmin(groupId);
+      }
+
+      // -- kommentek egyszerűen (opcionális)
+      match /taskComments/{commentId} {
+        allow read: if isMember(groupId);
+        allow create: if isMember(groupId) &&
+          request.resource.data.keys().hasOnly(
+            ['taskId','groupId','authorId','text','createdAt','authorName']
+          ) &&
+          request.resource.data.authorId == uid();
+        allow update, delete: if false; // MVP: nem szerkesztünk
+      }
+
+      // -- jutalmak (shop)
+      match /rewards/{rewardId} {
+        allow read: if isMember(groupId);
+        allow create, update, delete: if isAdmin(groupId);
+      }
+
+      // -- vásárlások (kuponok)
+      match /purchases/{purchaseId} {
+        // olvasás: admin mindent; user csak a SAJÁT vásárlásait
+        allow read: if isAdmin(groupId) || (isMember(groupId) && resource.data.userId == uid());
+
+        // létrehozás: user a saját nevében; ár ellenőrzése a reward doc ellen (active + ár egyezés)
+        allow create: if isMember(groupId) &&
+          request.resource.data.keys().hasOnly(
+            ['groupId','userId','rewardId','pricePointsAtPurchase','createdAt','status']
+          ) &&
+          request.resource.data.userId == uid() &&
+          request.resource.data.status == 'purchased' &&
+          request.resource.data.createdAt is timestamp &&
+          request.resource.data.pricePointsAtPurchase is int &&
+          exists(/databases/$(database)/documents/groups/$(groupId)/rewards/$(request.resource.data.rewardId)) &&
+          get(/databases/$(database)/documents/groups/$(groupId)/rewards/$(request.resource.data.rewardId)).data.active == true &&
+          get(/databases/$(database)/documents/groups/$(groupId)/rewards/$(request.resource.data.rewardId)).data.pricePoints
+            == request.resource.data.pricePointsAtPurchase;
+
+        // státusz: csak admin állíthatja 'redeemed'-re
+        allow update: if isAdmin(groupId) &&
+          request.resource.data.diff(resource.data).changedKeys().hasOnly(['status','redeemedAt','redeemedBy']);
+        allow delete: if isAdmin(groupId);
+      }
+
+      // -- pont tranzakciók (ledger)
+      match /pointTransactions/{txId} {
+        allow read: if isMember(groupId);
+        // v1: csak admin írhat; immutable
+        allow create: if isAdmin(groupId) &&
+          request.resource.data.keys().hasOnly(
+            ['groupId','userId','delta','reason','taskId','purchaseId','at','createdBy']
+          ) &&
+          request.resource.data.userId is string &&
+          request.resource.data.delta is int &&
+          request.resource.data.reason in ['task_done','penalty','purchase','adjust'] &&
+          request.resource.data.at is timestamp &&
+          request.resource.data.createdBy == uid();
+        allow update, delete: if false;
+      }
+    }
+  }
+}
